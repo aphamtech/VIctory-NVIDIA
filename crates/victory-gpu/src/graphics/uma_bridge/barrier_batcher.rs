@@ -42,6 +42,10 @@ pub struct CoalescingBarrierBatcher {
     /// Reusable dense output buffer to avoid per-flush heap allocations.
     flush_scratch: Vec<TranslatedBarrier>,
     stats: BarrierBatchStats,
+    /// When `true`, only exact `before == after` transitions are cancelled as no-ops
+    /// (preventing desync when an external command-list state tracker already handles
+    /// read-subset stripping and expects `after` to match D3D12's exact resource state).
+    exact_state_tracking: bool,
 }
 
 impl CoalescingBarrierBatcher {
@@ -49,6 +53,15 @@ impl CoalescingBarrierBatcher {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a barrier batcher synchronized with an external exact D3D12 state tracker.
+    #[must_use]
+    pub fn with_exact_state_tracking() -> Self {
+        Self {
+            exact_state_tracking: true,
+            ..Self::default()
+        }
     }
 
     /// Creates a barrier batcher with pre-allocated pending capacity.
@@ -105,8 +118,14 @@ impl CoalescingBarrierBatcher {
     }
 
     #[inline]
-    fn is_noop_or_redundant_read(before: ResourceStateFlags, after: ResourceStateFlags) -> bool {
-        before == after || (before.is_read_only() && after.is_read_only() && before.contains(after))
+    fn is_noop_or_redundant_read(&self, before: ResourceStateFlags, after: ResourceStateFlags) -> bool {
+        if before == after {
+            return true;
+        }
+        !self.exact_state_tracking
+            && before.is_read_only()
+            && after.is_read_only()
+            && before.contains(after)
     }
 
     fn push_raw_transition(&mut self, desc: TransitionBarrierDesc) {
@@ -132,7 +151,7 @@ impl BarrierBatcher for CoalescingBarrierBatcher {
         let before = ResourceStateFlags::from_xbox_raw(desc.before.0);
         let after = ResourceStateFlags::from_xbox_raw(desc.after.0);
 
-        if Self::is_noop_or_redundant_read(before, after) {
+        if self.is_noop_or_redundant_read(before, after) {
             self.stats.stripped_noop_or_read_to_read += 1;
             return;
         }
@@ -174,7 +193,7 @@ impl BarrierBatcher for CoalescingBarrierBatcher {
                     && prev.after.contains(before));
             if chains_cleanly && !prev.after.has_write() {
                 self.stats.folded_transitions += 1;
-                if Self::is_noop_or_redundant_read(prev.before, after) {
+                if self.is_noop_or_redundant_read(prev.before, after) {
                     // Cancels `A -> B -> A` (or `A_read -> B_read -> A_subset`) cleanly.
                     self.pending[prev_idx] = None;
                     self.live_count -= 1;

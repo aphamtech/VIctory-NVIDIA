@@ -379,6 +379,8 @@ pub struct PinnedLease {
     monotonic_start: u64,
     monotonic_end: u64,
     upload_slice: Option<UploadSlice>,
+    /// One-shot heap buffer for rare oversized reads exceeding the staging ring's capacity.
+    _overflow_buf: Option<Box<[u8]>>,
 }
 
 // SAFETY: Each `PinnedLease` uniquely owns its disjoint `[ptr, ptr + len)` byte slice
@@ -386,6 +388,22 @@ pub struct PinnedLease {
 unsafe impl Send for PinnedLease {}
 
 impl PinnedLease {
+    /// Allocates a one-shot heap-backed lease for reads larger than the staging ring capacity.
+    fn new_overflow(len: usize) -> Self {
+        let mut buf = vec![0u8; len.max(1)].into_boxed_slice();
+        // SAFETY: `buf` has non-zero length and remains pinned on the heap inside `_overflow_buf`
+        // for the full lifetime of this `PinnedLease`.
+        let ptr = unsafe { NonNull::new_unchecked(buf.as_mut_ptr()) };
+        Self {
+            ptr,
+            len,
+            ring_offset: 0,
+            monotonic_start: 0,
+            monotonic_end: 0,
+            upload_slice: None,
+            _overflow_buf: Some(buf),
+        }
+    }
     /// Returns the raw base pointer for OS async I/O (`ReadFile` / `io_uring`) destinations.
     #[inline]
     #[must_use]
@@ -540,6 +558,7 @@ impl PinnedUploadRing {
                         monotonic_start: 0,
                         monotonic_end: 0,
                         upload_slice: None,
+                        _overflow_buf: None,
                     });
                 }
                 let aligned_len = len
@@ -563,6 +582,34 @@ impl PinnedUploadRing {
                     let new_head = cur_head.wrapping_add(total_advance);
                     let in_flight = new_head.saturating_sub(cur_tail);
                     if in_flight > s.capacity as u64 {
+                        // Avoid empty-ring wrap livelock: when `cur_head == cur_tail` past the
+                        // midpoint and `aligned_len > capacity - physical_off`, advance `head`
+                        // across `wrap_padding` and immediately retire/reclaim that empty tail
+                        // padding so the allocation can succeed from ring offset 0.
+                        if wrap_padding > 0 && cur_head == cur_tail {
+                            let pad_end = cur_head.wrapping_add(wrap_padding as u64);
+                            match s.head.compare_exchange_weak(
+                                cur_head,
+                                pad_end,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => {
+                                    s.retired_queue.push(RetiredRange {
+                                        monotonic_start: cur_head,
+                                        monotonic_end: pad_end,
+                                        retire_after_fence: 0,
+                                    });
+                                    let _ = self.reclaim_completed(0);
+                                    cur_head = s.head.load(Ordering::Acquire);
+                                    continue;
+                                }
+                                Err(observed) => {
+                                    cur_head = observed;
+                                    continue;
+                                }
+                            }
+                        }
                         return Err(VelocityIoError::StagingRingFull { requested: len });
                     }
 
@@ -586,6 +633,7 @@ impl PinnedUploadRing {
                                 monotonic_start: cur_head,
                                 monotonic_end: new_head,
                                 upload_slice: None,
+                                _overflow_buf: None,
                             });
                         }
                         Err(observed) => cur_head = observed,
@@ -609,6 +657,7 @@ impl PinnedUploadRing {
                     monotonic_start: 0,
                     monotonic_end: 0,
                     upload_slice: Some(slice),
+                    _overflow_buf: None,
                 })
             }
         }
@@ -1584,6 +1633,177 @@ impl InOrderCommitter {
     }
 }
 
+/// Per-queue completion inbox & wakeup primitive used when multiple [`VelocityQueue`]s
+/// share a single [`VelocityFactory`] (and therefore a single OS IOCP / `io_uring` backend).
+///
+/// Holds no back-reference to [`IoCompletionDispatcher`] so `Arc` cycles cannot occur.
+struct QueueInbox {
+    completions: SegQueue<AsyncReadCompletion>,
+    wake_lock: Mutex<bool>,
+    wake_cv: Condvar,
+}
+
+impl QueueInbox {
+    fn new() -> Self {
+        Self {
+            completions: SegQueue::new(),
+            wake_lock: Mutex::new(false),
+            wake_cv: Condvar::new(),
+        }
+    }
+
+    fn push(&self, completion: AsyncReadCompletion) {
+        self.completions.push(completion);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        let mut flag = self.wake_lock.lock().unwrap_or_else(|e| e.into_inner());
+        *flag = true;
+        self.wake_cv.notify_one();
+    }
+}
+
+struct DispatcherShared {
+    io_backend: Arc<dyn AsyncIoBackend>,
+    next_op_id: AtomicU64,
+    shutdown: AtomicBool,
+    routes: Mutex<HashMap<u64, Arc<QueueInbox>>>,
+    active_cv: Condvar,
+}
+
+/// Factory-wide single-reaper async I/O completion router.
+///
+/// Prevents completion stealing and `op_id` collisions when a title creates many
+/// [`VelocityQueue`] instances (e.g., 17 `fiDeviceDirectStorage` queues) sharing one
+/// `Win32OverlappedIo` IOCP handle or Linux `io_uring`.
+struct IoCompletionDispatcher {
+    shared: Arc<DispatcherShared>,
+    reaper: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl IoCompletionDispatcher {
+    fn new(io_backend: Arc<dyn AsyncIoBackend>) -> Result<Arc<Self>, VelocityIoError> {
+        let shared = Arc::new(DispatcherShared {
+            io_backend,
+            next_op_id: AtomicU64::new(1),
+            shutdown: AtomicBool::new(false),
+            routes: Mutex::new(HashMap::new()),
+            active_cv: Condvar::new(),
+        });
+        let thread_shared = Arc::clone(&shared);
+        let handle = thread::Builder::new()
+            .name(String::from("velocity-io-reaper"))
+            .spawn(move || dispatcher_reaper_loop(thread_shared))
+            .map_err(|e| VelocityIoError::IoFailure {
+                os_code: e.raw_os_error(),
+                message: format!("failed to spawn velocity-io reaper thread: {e}"),
+            })?;
+        Ok(Arc::new(Self {
+            shared,
+            reaper: Mutex::new(Some(handle)),
+        }))
+    }
+
+    #[inline]
+    fn alloc_op_id(&self) -> u64 {
+        self.shared.next_op_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn submit_routed_batch(
+        &self,
+        inbox: &Arc<QueueInbox>,
+        ops: &[AsyncReadOp],
+    ) -> Result<usize, VelocityIoError> {
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        // Register routes BEFORE issuing OS async I/O so an immediate completion on
+        // another core always finds its owning queue's inbox.
+        {
+            let mut routes = self.shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+            for op in ops {
+                routes.insert(op.op_id, Arc::clone(inbox));
+            }
+            self.shared.active_cv.notify_one();
+        }
+        match self.shared.io_backend.submit_read_batch(ops) {
+            Ok(submitted) => {
+                if submitted < ops.len() {
+                    let mut routes = self.shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+                    for op in &ops[submitted..] {
+                        routes.remove(&op.op_id);
+                    }
+                }
+                Ok(submitted)
+            }
+            Err(err) => {
+                let mut routes = self.shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+                for op in ops {
+                    routes.remove(&op.op_id);
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for IoCompletionDispatcher {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        {
+            let _routes = self.shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.active_cv.notify_all();
+        }
+        if let Some(handle) = self
+            .reaper
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn dispatcher_reaper_loop(shared: Arc<DispatcherShared>) {
+    let mut batch: Vec<AsyncReadCompletion> = Vec::with_capacity(64);
+    loop {
+        {
+            let mut routes = shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+            while routes.is_empty() && !shared.shutdown.load(Ordering::Acquire) {
+                routes = shared
+                    .active_cv
+                    .wait(routes)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            if routes.is_empty() && shared.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        batch.clear();
+        match shared
+            .io_backend
+            .poll_completions(&mut batch, Duration::from_millis(2))
+        {
+            Ok(n) if n > 0 => {
+                let mut routes = shared.routes.lock().unwrap_or_else(|e| e.into_inner());
+                for completion in batch.drain(..) {
+                    if let Some(inbox) = routes.remove(&completion.op_id) {
+                        inbox.push(completion);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(%err, "velocity_io: async I/O reaper poll_completions failed");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 struct QueueShared {
     priority: DStoragePriority,
     capacity: usize,
@@ -1593,8 +1813,8 @@ struct QueueShared {
     submit_seal_lock: Mutex<()>,
     next_submit_seq: AtomicU64,
     submitted_batches: SegQueue<SealedBatch>,
-    io_wake_lock: Mutex<bool>,
-    io_wake_cv: Condvar,
+    inbox: Arc<QueueInbox>,
+    dispatcher: Option<Arc<IoCompletionDispatcher>>,
     decompress_queue: SegQueue<DecompressWorkItem>,
     decompress_wake_lock: Mutex<usize>,
     decompress_wake_cv: Condvar,
@@ -1609,9 +1829,7 @@ struct QueueShared {
 
 impl QueueShared {
     fn wake_io_pump(&self) {
-        let mut flag = self.io_wake_lock.lock().unwrap_or_else(|e| e.into_inner());
-        *flag = true;
-        self.io_wake_cv.notify_one();
+        self.inbox.wake();
     }
 
     fn push_decompress_work(&self, item: DecompressWorkItem) {
@@ -1679,6 +1897,17 @@ impl VelocityQueue {
         hooks: Arc<dyn DStoragePlatformHooks>,
         ring: Arc<PinnedUploadRing>,
     ) -> Result<Arc<Self>, VelocityIoError> {
+        Self::new_internal(config, io_backend, None, gpu_decompress, hooks, ring)
+    }
+
+    fn new_internal(
+        config: VelocityQueueConfig,
+        io_backend: Arc<dyn AsyncIoBackend>,
+        dispatcher: Option<Arc<IoCompletionDispatcher>>,
+        gpu_decompress: Arc<GpuDecompressQueue>,
+        hooks: Arc<dyn DStoragePlatformHooks>,
+        ring: Arc<PinnedUploadRing>,
+    ) -> Result<Arc<Self>, VelocityIoError> {
         let capacity = config.capacity.max(2);
         let worker_count = config.decompress_workers.clamp(1, 16);
 
@@ -1691,8 +1920,8 @@ impl VelocityQueue {
             submit_seal_lock: Mutex::new(()),
             next_submit_seq: AtomicU64::new(0),
             submitted_batches: SegQueue::new(),
-            io_wake_lock: Mutex::new(false),
-            io_wake_cv: Condvar::new(),
+            inbox: Arc::new(QueueInbox::new()),
+            dispatcher,
             decompress_queue: SegQueue::new(),
             decompress_wake_lock: Mutex::new(0),
             decompress_wake_cv: Condvar::new(),
@@ -1988,20 +2217,21 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
                 continue;
             };
             let len = size as usize;
-            if let Some(cap) = shared.ring.capacity_bytes()
-                && len > cap
+            let lease_result = if shared
+                .ring
+                .capacity_bytes()
+                .is_some_and(|cap| len > cap)
             {
-                shared.report_request_done(
-                    seq,
-                    velocity_error_to_hresult(&VelocityIoError::StagingRingFull {
-                        requested: len,
-                    }),
-                );
-                continue;
-            }
-            match shared.ring.try_lease(len) {
+                Ok(PinnedLease::new_overflow(len))
+            } else {
+                shared.ring.try_lease(len)
+            };
+            match lease_result {
                 Ok(lease) => {
-                    let op_id = shared.next_op_id.fetch_add(1, Ordering::Relaxed);
+                    let op_id = match shared.dispatcher {
+                        Some(ref disp) => disp.alloc_op_id(),
+                        None => shared.next_op_id.fetch_add(1, Ordering::Relaxed),
+                    };
                     submit_ops.push(AsyncReadOp {
                         op_id,
                         file,
@@ -2024,9 +2254,13 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
             }
         }
 
-        // 4. Submit batch to OS async I/O backend.
+        // 4. Submit batch to OS async I/O backend (via shared dispatcher when factory-owned).
         if !submit_ops.is_empty() {
-            match shared.io_backend.submit_read_batch(&submit_ops) {
+            let submit_res = match shared.dispatcher {
+                Some(ref disp) => disp.submit_routed_batch(&shared.inbox, &submit_ops),
+                None => shared.io_backend.submit_read_batch(&submit_ops),
+            };
+            match submit_res {
                 Ok(submitted) => {
                     let mut iter = staged_meta.into_iter();
                     for _ in 0..submitted {
@@ -2063,11 +2297,45 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
             } else {
                 Duration::from_millis(2)
             };
-            if let Ok(n) = shared
-                .io_backend
-                .poll_completions(&mut completions, poll_timeout)
-                && n > 0
-            {
+            let got = if shared.dispatcher.is_some() {
+                while let Some(c) = shared.inbox.completions.pop() {
+                    completions.push(c);
+                }
+                if completions.is_empty()
+                    && shared.submitted_batches.is_empty()
+                    && !shared.closed.load(Ordering::Acquire)
+                {
+                    let mut wake = shared
+                        .inbox
+                        .wake_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if !*wake
+                        && shared.inbox.completions.is_empty()
+                        && shared.submitted_batches.is_empty()
+                        && !shared.closed.load(Ordering::Acquire)
+                    {
+                        let (guard, _) = shared
+                            .inbox
+                            .wake_cv
+                            .wait_timeout(wake, poll_timeout)
+                            .unwrap_or_else(|e| e.into_inner());
+                        wake = guard;
+                    }
+                    *wake = false;
+                    drop(wake);
+                    while let Some(c) = shared.inbox.completions.pop() {
+                        completions.push(c);
+                    }
+                }
+                completions.len()
+            } else {
+                shared
+                    .io_backend
+                    .poll_completions(&mut completions, poll_timeout)
+                    .unwrap_or(0)
+            };
+            if got > 0 {
                 for completion in completions.drain(..) {
                     let Some(entry) = inflight.remove(&completion.op_id) else {
                         continue;
@@ -2081,6 +2349,7 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
                             os_code: Some(code),
                             message: format!("async read op {} failed", completion.op_id),
                         };
+                        tracing::warn!(%err, seq = entry.seq, "velocity_io: async file read failed");
                         shared
                             .ring
                             .retire_lease(entry.lease, GpuFenceToken::default());
@@ -2097,6 +2366,7 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
                             needed: expected_size,
                             got: completion.bytes_read,
                         };
+                        tracing::warn!(%err, seq = entry.seq, "velocity_io: unexpected EOF");
                         shared
                             .ring
                             .retire_lease(entry.lease, GpuFenceToken::default());
@@ -2136,12 +2406,18 @@ fn io_pump_loop(shared: Arc<QueueShared>) {
 
         // 8. Park until a new batch is submitted or the queue is closed.
         let mut wake = shared
-            .io_wake_lock
+            .inbox
+            .wake_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !*wake && shared.submitted_batches.is_empty() && !shared.closed.load(Ordering::Acquire) {
+        if !*wake
+            && shared.submitted_batches.is_empty()
+            && shared.inbox.completions.is_empty()
+            && !shared.closed.load(Ordering::Acquire)
+        {
             let (guard, _) = shared
-                .io_wake_cv
+                .inbox
+                .wake_cv
                 .wait_timeout(wake, Duration::from_millis(5))
                 .unwrap_or_else(|e| e.into_inner());
             wake = guard;
@@ -2159,7 +2435,10 @@ fn decompress_worker_loop(shared: Arc<QueueShared>) {
             let (result, retire_fence) = execute_decompress_item(&shared, item);
             let hr = match result {
                 Ok(()) => S_OK,
-                Err(ref err) => velocity_error_to_hresult(err),
+                Err(ref err) => {
+                    tracing::warn!(seq = retire_fence.0, %err, "velocity_io: DirectStorage request failed");
+                    velocity_error_to_hresult(err)
+                }
             };
             shared.report_request_done(retire_fence.0, hr);
             shared
@@ -2317,11 +2596,17 @@ fn deliver_destination(
                         "destination memory address is null",
                     ));
                 }
+                // Open any GPU-side read-only write-watch guards covering `[address, address + len)`
+                // before writing, matching the legacy DirectStorage path in `dstorage.rs`.
+                #[cfg(windows)]
+                let writing_guard = crate::watch::kernel_writing(address, bytes.len());
                 // SAFETY: Caller guarantees destination `[address, address + size)` is mapped
                 // and exclusively writable for the submitted DirectStorage request until status completion.
                 unsafe {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len());
                 }
+                #[cfg(windows)]
+                drop(writing_guard);
                 hooks.notify_memory_written(address, bytes.len());
             }
             Ok(())
@@ -2345,6 +2630,8 @@ fn deliver_destination(
 /// Safe factory controller backing `IDStorageFactoryX`.
 pub struct VelocityFactory {
     io_backend: Arc<dyn AsyncIoBackend>,
+    dispatcher: Mutex<Option<Arc<IoCompletionDispatcher>>>,
+    shared_ring: Mutex<Option<Arc<PinnedUploadRing>>>,
     gpu_decompress: Arc<GpuDecompressQueue>,
     hooks: Arc<dyn DStoragePlatformHooks>,
     upload_allocator: Option<Arc<dyn UploadAllocator>>,
@@ -2375,11 +2662,36 @@ impl VelocityFactory {
     ) -> Self {
         Self {
             io_backend,
+            dispatcher: Mutex::new(None),
+            shared_ring: Mutex::new(None),
             gpu_decompress,
             hooks: Arc::new(DefaultPlatformHooks),
             upload_allocator: None,
             staging_buffer_size: AtomicU64::new(Self::DEFAULT_STAGING_BUFFER_BYTES),
         }
+    }
+
+    fn get_or_start_dispatcher(&self) -> Result<Arc<IoCompletionDispatcher>, VelocityIoError> {
+        let mut guard = self.dispatcher.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref disp) = *guard {
+            return Ok(Arc::clone(disp));
+        }
+        let disp = IoCompletionDispatcher::new(Arc::clone(&self.io_backend))?;
+        *guard = Some(Arc::clone(&disp));
+        Ok(disp)
+    }
+
+    fn get_or_create_shared_ring(&self) -> Result<Arc<PinnedUploadRing>, VelocityIoError> {
+        let mut guard = self.shared_ring.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref ring) = *guard {
+            return Ok(Arc::clone(ring));
+        }
+        // Size at least 64 MiB (or `staging_buffer_size`) so all queues created by the title
+        // share one cached host ring without duplicating 32 MiB per queue.
+        let bytes = (self.staging_buffer_size() as usize).max(64 * 1024 * 1024);
+        let ring = Arc::new(PinnedUploadRing::new_standalone(bytes)?);
+        *guard = Some(Arc::clone(&ring));
+        Ok(ring)
     }
 
     /// Overrides the [`DStoragePlatformHooks`] implementation (e.g. `victory-hle` hooks).
@@ -2442,18 +2754,17 @@ impl VelocityFactory {
                 Arc::clone(allocator),
                 256,
             ))
+        } else if config.staging_ring_bytes > 0 {
+            Arc::new(PinnedUploadRing::new_standalone(config.staging_ring_bytes)?)
         } else {
-            let bytes = if config.staging_ring_bytes > 0 {
-                config.staging_ring_bytes
-            } else {
-                self.staging_buffer_size() as usize
-            };
-            Arc::new(PinnedUploadRing::new_standalone(bytes)?)
+            self.get_or_create_shared_ring()?
         };
 
-        VelocityQueue::new(
+        let dispatcher = self.get_or_start_dispatcher()?;
+        VelocityQueue::new_internal(
             config,
             Arc::clone(&self.io_backend),
+            Some(dispatcher),
             Arc::clone(&self.gpu_decompress),
             Arc::clone(&self.hooks),
             ring,
@@ -2476,7 +2787,9 @@ impl VelocityFactory {
         let config = VelocityQueueConfig {
             capacity: usize::from(desc.capacity).max(2),
             priority: desc.priority_enum(),
-            staging_ring_bytes: self.staging_buffer_size() as usize,
+            // `0` selects the factory-wide shared cached staging ring so titles creating
+            // many queues (e.g., 17 queues) do not duplicate 32 MiB per queue.
+            staging_ring_bytes: 0,
             decompress_workers: 2,
             name,
         };

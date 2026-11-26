@@ -5,7 +5,7 @@ rem Motion, UMA Bridge, and Velocity I/O enabled).
 rem
 rem   scripts\launch-game-fast.bat
 rem   scripts\launch-game-fast.bat -NoPrecompile
-rem   scripts\launch-game-fast.bat -Resolution 480
+rem   scripts\launch-game-fast.bat -Resolution 540
 rem   scripts\launch-game-fast.bat -NoSmoothMotion
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions

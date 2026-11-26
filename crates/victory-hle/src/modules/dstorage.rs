@@ -299,11 +299,13 @@ fn build_velocity_factory(enable_legacy_bcpack: bool) -> Result<VelocityFactory,
     let compute: Arc<dyn ComputeQueueBackend> = victory_gpu::shared_compute_queue()
         .unwrap_or_else(|| Arc::new(MockComputeQueueBackend::new(2)));
     let gpu_decompress = Arc::new(GpuDecompressQueue::with_registry(compute, registry));
-    let mut factory = VelocityFactory::new(io, gpu_decompress)
+    // Keep HLE DirectStorage staging in cached host RAM (the factory's shared
+    // 4 KiB-aligned `PinnedUploadRing`) rather than a Write-Combine ReBAR VRAM
+    // heap, because HLE destinations target CPU/physical pages and decompress
+    // on CPU workers (`zlib-rs` / `bcpack`), where reading back from WC VRAM
+    // stalls PCIe read bandwidth.
+    let factory = VelocityFactory::new(io, gpu_decompress)
         .with_platform_hooks(Arc::new(HleDStoragePlatformHooks));
-    if let Some(allocator) = victory_gpu::shared_rebar_allocator() {
-        factory = factory.with_upload_allocator(allocator);
-    }
     Ok(factory)
 }
 

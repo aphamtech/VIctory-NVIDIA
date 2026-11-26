@@ -796,19 +796,11 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                         }
                     }
                     1 => {
-                        let before = if b.first.is_null() {
-                            Some(None)
-                        } else {
-                            crate::resource::host_resource(b.first).map(Some)
-                        };
-                        let after = if b.second == 0 {
-                            Some(None)
-                        } else {
-                            crate::resource::host_resource(b.second as This).map(Some)
-                        };
-                        if let (Some(before), Some(after)) = (before, after) {
-                            list.push_aliasing_barrier(before, after);
-                        }
+                        // Host textures are committed resources (distinct host heaps);
+                        // D3D12 rejects non-null committed resources in aliasing barriers
+                        // with E_INVALIDARG on Close(). Preserve ordering via a global
+                        // UAV barrier when an explicit Xbox aliasing barrier is seen.
+                        list.push_uav_barrier(None);
                     }
                     2 => {
                         if b.first.is_null() {

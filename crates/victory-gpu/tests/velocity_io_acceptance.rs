@@ -1231,3 +1231,145 @@ fn d3d12_warp_copy_and_async_compute_fence_sync_roundtrip() {
         "second 8 KiB (Copy Queue -> HLSL cs_5_1 compute shader) mismatch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. Multi-Queue Shared IOCP Routing & Empty-Ring Wrap Regression Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_queue_factory_routes_completions_without_stealing_or_colliding() {
+    #[cfg(windows)]
+    let (io, temp_dir): (Arc<dyn AsyncIoBackend>, Option<tempfile::TempDir>) = {
+        use victory_gpu::graphics::velocity_io::Win32OverlappedIo;
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let io = Arc::new(Win32OverlappedIo::new().expect("create Win32OverlappedIo"));
+        (io, Some(dir))
+    };
+    #[cfg(not(windows))]
+    let (io, temp_dir): (Arc<dyn AsyncIoBackend>, Option<()>) = {
+        let mem = Arc::new(InMemoryAsyncIo::new());
+        (mem, None)
+    };
+
+    let compute = Arc::new(MockComputeQueueBackend::new(1));
+    let decompress = Arc::new(GpuDecompressQueue::new(compute));
+    let factory = VelocityFactory::new(Arc::clone(&io), decompress);
+
+    const NUM_QUEUES: usize = 16;
+    const CHUNK_BYTES: usize = 4096;
+    const CHUNKS_PER_QUEUE: usize = 8;
+
+    let mut files = Vec::with_capacity(NUM_QUEUES);
+    let mut expected_blobs = Vec::with_capacity(NUM_QUEUES);
+    for q in 0..NUM_QUEUES {
+        let blob = deterministic_payload(CHUNK_BYTES * CHUNKS_PER_QUEUE, (q as u8).wrapping_mul(13));
+        #[cfg(windows)]
+        let file = {
+            let path = temp_dir
+                .as_ref()
+                .unwrap()
+                .path()
+                .join(format!("archive_{q}.bin"));
+            std::fs::write(&path, &blob).expect("write temp archive");
+            factory.open_file(&path).expect("open temp archive")
+        };
+        #[cfg(not(windows))]
+        let file = {
+            let _ = &temp_dir;
+            let name = format!("archive_{q}.bin");
+            let mem = Arc::new(InMemoryAsyncIo::new());
+            mem.add_file(&name, blob.clone());
+            factory.open_file(Path::new(&name)).expect("open mem archive")
+        };
+        files.push(file);
+        expected_blobs.push(blob);
+    }
+
+    // Create 16 queues on the SAME factory (matching GTA VI's 17 fiDeviceDirectStorage queues)
+    // all sharing one IOCP handle and one shared staging ring (`staging_ring_bytes: 0`).
+    let mut queues = Vec::with_capacity(NUM_QUEUES);
+    let mut statuses = Vec::with_capacity(NUM_QUEUES);
+    let mut destinations: Vec<Vec<Vec<u8>>> = Vec::with_capacity(NUM_QUEUES);
+
+    for q in 0..NUM_QUEUES {
+        let queue = factory
+            .create_queue(VelocityQueueConfig {
+                capacity: 64,
+                priority: DStoragePriority::Realtime,
+                staging_ring_bytes: 0,
+                decompress_workers: 2,
+                name: format!("multi-q-{q}"),
+            })
+            .expect("create factory queue");
+        let status = factory.create_status_array(1);
+        let mut q_dsts = vec![vec![0xAAu8; CHUNK_BYTES]; CHUNKS_PER_QUEUE];
+        for (c, dst) in q_dsts.iter_mut().enumerate() {
+            queue
+                .enqueue_request(DStorageRequestDesc {
+                    codec: DecompressionCodec::Uncompressed,
+                    secondary_codec: None,
+                    intermediate_size: 0,
+                    source: DStorageSource::File {
+                        file: files[q].handle_id(),
+                        offset: (c * CHUNK_BYTES) as u64,
+                        size: CHUNK_BYTES as u32,
+                    },
+                    destination: DStorageDestination::Memory {
+                        address: dst.as_mut_ptr() as usize,
+                        size: CHUNK_BYTES as u32,
+                    },
+                    cancellation_tag: ((q as u64) << 16) | (c as u64),
+                })
+                .expect("enqueue");
+        }
+        queue
+            .enqueue_status(Arc::clone(&status), 0)
+            .expect("enqueue status");
+        queues.push(queue);
+        statuses.push(status);
+        destinations.push(q_dsts);
+    }
+
+    // Submit all 16 queues simultaneously to maximally stress shared IOCP completion routing.
+    for queue in &queues {
+        queue.submit().expect("submit");
+    }
+
+    for (q, (queue, status)) in queues.iter().zip(statuses.iter()).enumerate() {
+        assert!(
+            queue.wait_idle(Duration::from_secs(10)),
+            "queue {q} deadlocked waiting for shared IOCP completions"
+        );
+        assert!(status.is_complete(0), "queue {q} status not complete");
+        assert_eq!(status.hresult(0), S_OK, "queue {q} status error");
+        for (c, dst) in destinations[q].iter().enumerate() {
+            let start = c * CHUNK_BYTES;
+            assert_eq!(
+                dst.as_slice(),
+                &expected_blobs[q][start..start + CHUNK_BYTES],
+                "queue {q} chunk {c} data mismatch (completion crossed queues)"
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_ring_past_midpoint_wraps_large_lease_without_livelock() {
+    let ring = PinnedUploadRing::new_standalone(16 * 1024).expect("16 KiB ring");
+    // Advance head and tail past the midpoint (10 KiB of 16 KiB) and reclaim completely.
+    let first = ring.try_lease(10 * 1024).expect("initial 10 KiB lease");
+    ring.retire_lease(first, GpuFenceToken { queue_id: 0, value: 0 });
+    assert_eq!(ring.reclaim_completed(0), 1);
+    assert_eq!(ring.used_bytes(), 0);
+
+    // Request a 12 KiB lease (> remaining 6 KiB before wrap, <= 16 KiB capacity).
+    // Previously this returned StagingRingFull forever even though the ring was empty.
+    let large = ring
+        .try_lease(12 * 1024)
+        .expect("empty ring must wrap past padding and grant 12 KiB lease");
+    assert_eq!(large.len(), 12 * 1024);
+    assert_eq!(large.ring_offset(), 0);
+    ring.retire_lease(large, GpuFenceToken { queue_id: 0, value: 0 });
+    assert_eq!(ring.reclaim_completed(0), 1);
+    assert_eq!(ring.used_bytes(), 0);
+}

@@ -7,7 +7,7 @@ rem
 rem   scripts\launch-game.bat                     default Series S 540p speed set + precompile UI
 rem   scripts\launch-game.bat -NoPrecompile       skip shader precompilation UI on launch
 rem   scripts\launch-game.bat -Quality            fewer visual glitches
-rem   scripts\launch-game.bat -Resolution 720     720p internal render scale
+rem   scripts\launch-game.bat -Resolution 1080    720p internal render scale
 rem   scripts\launch-game.bat -SeriesX            Series X profile
 rem   scripts\launch-game.bat -NoSmoothMotion     run victory.exe directly
 rem

@@ -1357,10 +1357,18 @@ pub(crate) struct HostList {
 }
 
 /// Per-command-list barrier coalescing state for Subsystem A (`uma_bridge`).
-#[derive(Default)]
 struct UmaBarrierState {
     batcher: crate::graphics::uma_bridge::CoalescingBarrierBatcher,
     resources: std::collections::HashMap<crate::graphics::contracts::ResourceId, ID3D12Resource>,
+}
+
+impl Default for UmaBarrierState {
+    fn default() -> Self {
+        Self {
+            batcher: crate::graphics::uma_bridge::CoalescingBarrierBatcher::with_exact_state_tracking(),
+            resources: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -6422,6 +6430,21 @@ impl HostList {
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let current = o.get().1;
+                if crate::graphics::uma_bridge_enabled() {
+                    use crate::graphics::contracts::ResourceStateFlags;
+                    let cur_flags = ResourceStateFlags::from_xbox_raw(current);
+                    let want_flags = ResourceStateFlags::from_xbox_raw(wanted);
+                    // Strip redundant read-to-read subset transitions while keeping
+                    // `HostList::states` at `current`, so later transitions emit the
+                    // exact `StateBefore` matching the live D3D12 resource state.
+                    if cur_flags.is_read_only()
+                        && want_flags.is_read_only()
+                        && cur_flags.contains(want_flags)
+                    {
+                        return None;
+                    }
+                }
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 if before != wanted {
                     self.changed_something();
@@ -6486,6 +6509,8 @@ impl HostList {
     }
 
     /// Queues an aliasing barrier into this list's [`CoalescingBarrierBatcher`].
+    /// Only valid for true host-placed/reserved resources sharing an `ID3D12Heap` (or `(None, None)`).
+    #[allow(dead_code)]
     pub(crate) fn push_aliasing_barrier(
         &self,
         before: Option<&ID3D12Resource>,
@@ -6524,14 +6549,20 @@ impl HostList {
         uma.batcher.push_uav(UavBarrierDesc { resource: rid });
     }
 
-    /// Queries [`crate::resource::record_placed_aliasing_copies`] for `title_resource`
-    /// (resolving `Arc<HostTexture>` under the aliasing tracker lock so evicted resources
-    /// cannot be freed concurrently) and pushes any required D3D12 aliasing barriers into
-    /// this list's batcher.
+    /// Updates [`crate::resource::record_placed_aliasing_copies`] ownership tracking
+    /// for `title_resource`.
+    ///
+    /// Note: `HostTexture::texture` is currently backed by distinct committed host
+    /// resources (`CreateCommittedResource`), not host-placed resources on a shared
+    /// `ID3D12Heap`. Direct3D 12 rejects `D3D12_RESOURCE_BARRIER_TYPE_ALIASING` on
+    /// committed resources with `E_INVALIDARG (0x80070057)` at `Close()`, so we only
+    /// emit a global UAV ordering barrier on detected Xbox placed-heap ownership
+    /// changes rather than passing committed `ID3D12Resource` handles to an aliasing
+    /// barrier.
     pub(crate) fn record_placed_aliasing(&self, title_resource: crate::object::This) {
         let pairs = crate::resource::record_placed_aliasing_copies(title_resource);
-        for (before, after) in pairs {
-            self.push_aliasing_barrier(Some(&before.texture), Some(&after.texture));
+        if !pairs.is_empty() {
+            self.push_uav_barrier(None);
         }
     }
 
