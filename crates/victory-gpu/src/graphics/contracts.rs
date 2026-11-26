@@ -345,6 +345,8 @@ pub struct BufferCopyOp {
 pub trait CopyQueueBackend: Send + Sync {
     fn submit_buffer_copies(&self, copies: &[BufferCopyOp]) -> Result<GpuFenceToken, UmaBridgeError>;
     fn completed_fence_value(&self) -> u64;
+    /// Blocks until all submitted copy queue work has completed on the GPU (called on shutdown/drop).
+    fn drain_gpu(&self) {}
 }
 
 /// Subsystem A.1 — ReBAR-aware sub-allocator & non-ReBAR async Copy Queue ring fallback.

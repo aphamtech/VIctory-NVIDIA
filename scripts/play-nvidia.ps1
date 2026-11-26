@@ -2,6 +2,8 @@
 #   scripts\play-nvidia.ps1 -Exe <path of your own copy's executable>
 # -NoSmoothMotion  run target\<build>\victory.exe itself. By default a copy named victory_sm.exe is started instead,
 #                  so a Smooth Motion profile set for that exe in the NVIDIA App applies every time.
+# -NoPrecompile    skip the shader precompilation UI on launch (by default shaders are precompiled into the cache first;
+#                  closing the progress window also skips remaining shaders and launches immediately).
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
@@ -17,6 +19,7 @@
 param(
     [Parameter(Mandatory)][string]$Exe,
     [switch]$NoSmoothMotion,
+    [switch]$NoPrecompile,
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
@@ -103,5 +106,6 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
+if (-not $NoPrecompile) { $runArgs += '--precompile' }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }
