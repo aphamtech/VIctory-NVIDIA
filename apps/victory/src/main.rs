@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod play;
 mod precompile;
 mod progress;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -19,6 +21,70 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// The Direct3D 12 runtime this program asks Windows for: Microsoft's D3D12
+/// Agility SDK 1.614, from `D3D12\D3D12Core.dll` beside victory.exe where it
+/// is there (exported by build.rs). Windows uses it only where its own is
+/// older: Windows 10's stops at shader model 6.5, and the translated shaders
+/// are 6.6 (`victory play` fetches it there; 2026-11-27, an RTX 3060 on
+/// Windows 10 22H2 had every pipeline refused). Without the folder, nothing changes.
+///
+/// A `D3D12Core.dll` there of another version (other forks' guides put 1.618
+/// or 1.620 there) made Windows refuse Direct3D 12 altogether, "the D3D12 SDK
+/// version configuration of the host exe is invalid" (0x887E0003; 2026-11-27,
+/// an RTX 5080 and an RTX 3080 Ti on Windows 11): [`match_d3d12_core`] asks
+/// for the version of the file that is there, before Direct3D 12 is loaded.
+/// (An atomic: the same bytes as a `u32`, in memory that can be written.)
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKVersion: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(614);
+
+/// The Agility SDK version of a `D3D12Core.dll` (its file version is
+/// `1.<sdk>.<patch>.0`, e.g. 1.614.1.0): from the file's VS_FIXEDFILEINFO.
+fn agility_version(dll: &[u8]) -> Option<u32> {
+    let signature = 0xFEEF_04BD_u32.to_le_bytes();
+    let at = dll.windows(4).position(|w| w == signature)?;
+    let most = u32::from_le_bytes(dll.get(at + 8..at + 12)?.try_into().ok()?);
+    let (major, minor) = (most >> 16, most & 0xffff);
+    (major == 1 && minor >= 600).then_some(minor)
+}
+
+/// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
+/// beside this program, where there is one and it is not 614. First thing in
+/// `main`: Windows reads `D3D12SDKVersion` when Direct3D 12 is first used.
+#[cfg(windows)]
+fn match_d3d12_core() {
+    let Some(core) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("D3D12").join("D3D12Core.dll")))
+    else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&core) else { return };
+    match agility_version(&bytes) {
+        Some(v) if v != D3D12SDKVersion.load(std::sync::atomic::Ordering::Relaxed) => {
+            D3D12SDKVersion.store(v, std::sync::atomic::Ordering::Relaxed);
+            println!("{} is the D3D12 Agility SDK 1.{v}: asking Windows for that version.", core.display());
+        }
+        Some(_) => {}
+        None => println!("{} is not a D3D12 Agility SDK runtime Windows can use; move it away if Direct3D 12 fails.", core.display()),
+    }
+}
+
+/// `D3D12SDKPath`'s value: a pointer to a C string.
+#[cfg(windows)]
+#[repr(transparent)]
+pub struct SdkPath(*const std::ffi::c_char);
+// SAFETY: it points at a string literal, never written.
+#[cfg(windows)]
+unsafe impl Sync for SdkPath {}
+
+/// Where `D3D12Core.dll` is, from victory.exe's folder.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
 
 #[derive(Parser)]
 #[command(
@@ -155,6 +221,49 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Preload: `shaders` and then `warm` over the title's folder, and the
+    /// pipelines a run makes while it loads stored in the pipeline library
+    /// the runs start with; what they say is shown as they go (the F1 menu's "PRELOAD SHADERS" has the
+    /// launcher do this before the title starts). A while, maybe long on
+    /// slower hardware; an update of the translator or the driver needs it
+    /// again. Stopped, it goes on where it was the next time.
+    #[cfg(windows)]
+    Preload {
+        /// The title's folder (default: the configured game folder).
+        paths: Vec<PathBuf>,
+    },
+    /// Play: the title with this fork's settings, as a start with no
+    /// command at all does (a double click on the program beside the
+    /// title's `game_scarlett_master.exe`). F1 in the game is the settings
+    /// menu, F3 the stats panel.
+    #[cfg(windows)]
+    Play(play::Play),
+    /// Fetch NVIDIA's DLSS and frame generation files from NVIDIA's GitHub
+    /// (about 70 MB) to where `play` looks for them.
+    #[cfg(windows)]
+    GetDlss,
+    /// Fetch AMD's FSR 3 frame generation files from AMD's GitHub (about
+    /// 30 MB) to where `play` looks for them: frame generation on cards
+    /// without DLSS frame generation.
+    #[cfg(windows)]
+    GetFsr,
+    /// Fetch Microsoft's newer Direct3D 12 runtime (D3D12Core.dll, about
+    /// 22 MB from nuget.org) into `D3D12` beside this program: Windows 10,
+    /// whose own Direct3D 12 does not run the translated shaders. `play`
+    /// does it by itself where it is needed.
+    #[cfg(windows)]
+    GetD3d12,
+    /// Fetch MFG Unlocker (someone else's mod, github.com/dashdogy/MFG-Unlocker,
+    /// about 5 MB): DLSS frame generation on RTX 20 and 30 cards, which NVIDIA
+    /// does not support. `play` loads it with F1's MFG UNLOCKER on, and fetches
+    /// it by itself then.
+    #[cfg(windows)]
+    GetMfg,
+    /// Print the highest shader model the default GPU runs here (`play`
+    /// asks it in a process of its own).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ShaderModel,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -187,6 +296,24 @@ enum Command {
     Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
+    /// Check NVIDIA Streamline, DLSS and DLSS Frame Generation on this PC
+    /// without the title (`VICTORY_STREAMLINE_DIR`, `VICTORY_DLSS_MODE`,
+    /// `VICTORY_DLSS_PRESET`): what loads and what this GPU supports; with
+    /// --device, the host device handed over and DLSS run three times on
+    /// stand-in textures; with --present too, three seconds of presents with
+    /// frame generation in a window of ours.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// The output size, `<width>x<height>`.
+        #[arg(long, default_value = "2560x1440")]
+        output: String,
+        /// Make the host device and run DLSS on it.
+        #[arg(long)]
+        device: bool,
+        /// Present for three seconds with frame generation (with --device).
+        #[arg(long)]
+        present: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -202,13 +329,49 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
+    #[cfg(windows)]
+    match_d3d12_core();
+    // Before anything else can take the address space it needs.
+    #[cfg(windows)]
+    victory_hle::reserve_upload_space();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
-        return Ok(());
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some() {
+        victory_core::logging::init("info");
+        if victory_hle::modules::audio::capture::child() {
+            return Ok(());
+        }
     }
-    let cli = Cli::parse();
+    // Started with nothing after its name (a double click): play.
+    let bare = std::env::args_os().len() == 1;
+    let cli = if bare && cfg!(windows) { Cli::parse_from(["victory", "play"]) } else { Cli::parse() };
+    // Play puts its settings into the environment and names its log file
+    // before anything else is set up.
+    #[cfg(windows)]
+    if let Command::Play(options) = &cli.command {
+        // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
+        let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
+        let done = play::prepare(options).and_then(|ready| {
+            if preload {
+                play::preload(&ready.exe);
+            }
+            victory_core::logging::init("info");
+            // F1's MFG UNLOCKER: the mod, before the layer makes its device or loads Streamline.
+            play::load_mfg();
+            let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
+            // `play::preload` above does the shader precompilation this path
+            // used to ask `run` for.
+            run::run(&ready.exe, Unimplemented::Trap, false, true, console, false)
+        });
+        if let Err(e) = &done
+            && bare
+        {
+            eprintln!("Error: {e:#}");
+            play::hold_window();
+        }
+        return done;
+    }
+    victory_core::logging::init("info");
     match cli.command {
         Command::Inspect {
             file,
@@ -266,6 +429,35 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Preload { paths } => {
+            play::explain_preload();
+            translate::precompile(paths, None)?;
+            warm::run(None, None, false, false, None)?;
+            warm::into_library(None)
+        }
+        #[cfg(windows)]
+        Command::Play(_) => unreachable!("handled above"),
+        #[cfg(windows)]
+        Command::GetDlss => play::get_dlss(),
+        #[cfg(windows)]
+        Command::GetFsr => play::get_fsr(),
+        #[cfg(windows)]
+        Command::GetD3d12 => play::get_d3d12(),
+        #[cfg(windows)]
+        Command::GetMfg => play::get_mfg(),
+        #[cfg(windows)]
+        Command::ShaderModel => {
+            let model = victory_hle::streamline::highest_shader_model();
+            if let Some(core) = victory_hle::streamline::d3d12_core_path() {
+                println!("runtime {}", core.display());
+            }
+            match model {
+                Some((major, minor)) => println!("{major}.{minor}"),
+                None => println!("none"),
+            }
+            Ok(())
+        }
         Command::Run {
             exe,
             unimplemented,
@@ -281,6 +473,17 @@ fn main() -> Result<()> {
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::UpscalerCheck { output, device, present } => {
+            let size = output
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
+                .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
+            for line in victory_hle::streamline::check(size, device || present, present) {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -314,6 +517,30 @@ fn show_config() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// A D3D12Core.dll's VS_FIXEDFILEINFO: signature, structure version, then
+    /// the file version's high and low words (1.620.2.0 here).
+    fn core_bytes(major: u32, minor: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 40];
+        for w in [0xFEEF_04BD_u32, 0x0001_0000, (major << 16) | minor, 2 << 16] {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b.extend_from_slice(&[0u8; 16]);
+        b
+    }
+
+    #[test]
+    fn agility_versions_are_read_from_the_file() {
+        assert_eq!(super::agility_version(&core_bytes(1, 620)), Some(620));
+        assert_eq!(super::agility_version(&core_bytes(1, 614)), Some(614));
+        // Windows' own D3D12Core.dll (10.0.x) and files without the structure are not one.
+        assert_eq!(super::agility_version(&core_bytes(10, 0)), None);
+        assert_eq!(super::agility_version(&[0u8; 64]), None);
+        assert_eq!(super::agility_version(&core_bytes(1, 620)[..48]), None);
+    }
 }
 
 /// Paths given on the command line, or the configured game + test titles.

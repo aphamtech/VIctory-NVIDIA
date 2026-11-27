@@ -19,10 +19,9 @@
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-pub mod console;
-// LOCAL (port of fxceless #1189): Series S interface plane laid over the game (VICTORY_COMPOSE=1).
 #[cfg(windows)]
 mod compose;
+pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -34,17 +33,26 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 pub mod graphics;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod heap_marks;
+#[cfg(windows)]
 mod host;
+/// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
+/// (read by the input module).
+pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
 #[cfg(windows)]
 mod land;
 pub mod list;
@@ -62,6 +70,8 @@ pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod replay;
+#[cfg(windows)]
+mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -77,6 +87,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
@@ -96,6 +108,10 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// Reserves the address space for memory shaders read by address; call it
+/// first thing, before the process's other allocations can fill [4 GiB, 2^37).
+#[cfg(windows)]
+pub use upload::reserve_space as reserve_upload_space;
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
@@ -109,13 +125,20 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use shadow::title_memory_write_combined;
+#[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };
 
 /// Returns the lazily-initialized host ReBAR / Staging Copy Ring [`UploadAllocator`]

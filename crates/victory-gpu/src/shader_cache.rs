@@ -63,16 +63,12 @@ fn build() -> [u8; 32] {
         // served the translations an earlier run of the same
         // executable had cached with the switch unset.
         for name in [
-            "VICTORY_BVH_MISS",
-            // LOCAL: colours and image stores with NaN made 0.
-            "VICTORY_NAN_SCRUB",
-            // LOCAL (fxceless #1216): constant buffer slots marked.
-            "VICTORY_CONSTANT_MARKS",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
@@ -80,12 +76,23 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -296,11 +303,6 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.half_views.len() as u32);
-    for &(slot, dword) in &s.half_views {
-        word(&mut out, u32::from(slot));
-        word(&mut out, dword);
-    }
     out
 }
 
@@ -369,11 +371,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut half_views = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
-    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -384,7 +381,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-        half_views,
     })
 }
 
@@ -419,7 +415,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            half_views: vec![(0, 8), (4, 0)],
         }
     }
 
